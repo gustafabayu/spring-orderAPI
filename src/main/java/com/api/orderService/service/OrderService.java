@@ -15,6 +15,8 @@ import com.api.orderService.model.Order;
 import com.api.orderService.model.OrderLineItems;
 import com.api.orderService.repository.OrderRepository;
 
+import io.micrometer.tracing.Span;
+import io.micrometer.tracing.Tracer;
 import lombok.RequiredArgsConstructor;
 
 @Service
@@ -23,6 +25,7 @@ import lombok.RequiredArgsConstructor;
 public class OrderService {
     private final OrderRepository orderRepository;
     private final WebClient.Builder webClientBuilder;
+    private final Tracer tracer;
 
     public String placeOrder(OrderRequest orderRequest) {
         Order order = new Order();
@@ -35,26 +38,33 @@ public class OrderService {
         order.setOrderLineItemsList(orderLineItems);
 
         List<String> skuCodes = order.getOrderLineItemsList().stream()
-                    .map(OrderLineItems::getSkuCode)
-                    .toList();
+                .map(OrderLineItems::getSkuCode)
+                .toList();
 
-        //call inv serv, and place order if product is in stock
-        InventoryResponse[] inventoryResponsArray = webClientBuilder.build().get()
+        Span invetoryServiceLookup = tracer.nextSpan().name("InventoryServiceLookup");
+
+        try (Tracer.SpanInScope spanInScope = tracer.withSpan(invetoryServiceLookup.start())) {
+            // call inv serv, and place order if product is in stock
+            InventoryResponse[] inventoryResponsArray = webClientBuilder.build().get()
                     .uri("http://inventory-service/api/inventory",
                             uriBuilder -> uriBuilder.queryParam("skuCode", skuCodes).build())
                     .retrieve()
                     .bodyToMono(InventoryResponse[].class)
                     .block();
 
-        boolean allProductsInStock = Arrays.stream(inventoryResponsArray)
-                                        .allMatch(InventoryResponse::isInStock);
+            boolean allProductsInStock = Arrays.stream(inventoryResponsArray)
+                    .allMatch(InventoryResponse::isInStock);
 
-        if(allProductsInStock){
-            orderRepository.save(order);
-            return "Order Placed Successfully";
-        }else{
-            throw new IllegalArgumentException("Product is in not stock");
+            if (allProductsInStock) {
+                orderRepository.save(order);
+                return "Order Placed Successfully";
+            } else {
+                throw new IllegalArgumentException("Product is in not stock");
+            }
+        } finally {
+            invetoryServiceLookup.end();
         }
+
     }
 
     private OrderLineItems mapToDto(OrderLineItemsDto orderLineItemsDto) {
